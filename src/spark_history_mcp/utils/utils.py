@@ -88,7 +88,15 @@ class ApplicationDiscovery:
             return self._cache[app_id]["servers"]
 
         servers = []
+        seen_urls = set()
         for server_name, client in self.clients.items():
+            # Aliases of one History Server (e.g. "local" == "deb11") would
+            # cost an extra request each and add nothing.
+            url = getattr(getattr(client, "config", None), "url", None)
+            if isinstance(url, str):
+                if url.rstrip("/") in seen_urls:
+                    continue
+                seen_urls.add(url.rstrip("/"))
             logger.debug(f"Checking for application '{app_id}' in '{server_name}'")
             try:
                 client.get_application(app_id)
@@ -99,14 +107,7 @@ class ApplicationDiscovery:
                 )
                 continue
 
-        # Only remember where an application was found. A miss is often
-        # transient (the History Server has not picked up the event log yet, or
-        # a server was unreachable), and caching it would keep reporting the
-        # application as missing for the whole TTL.
-        if servers:
-            self._cache[app_id] = {"servers": servers, "last_updated": time.time()}
-        else:
-            self._cache.pop(app_id, None)
+        self._cache[app_id] = {"servers": servers, "last_updated": time.time()}
 
         return servers
 

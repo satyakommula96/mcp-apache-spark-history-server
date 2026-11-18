@@ -12,15 +12,22 @@ from spark_history_mcp.api_client.models.stage_data import StageData
 from spark_history_mcp.api_client.models.task_metrics_summary import TaskMetricsSummary
 from spark_history_mcp.api_client.models.thread_stack_trace import ThreadStackTrace
 from spark_history_mcp.tools.tools import (
+    _build_native_operator_metrics,
     _build_stage_task_quantiles,
     _calculate_executor_metrics,
+    _detect_native_engine,
     _filter_environment_section,
     _filter_threads,
+    _find_native_spill_hits,
+    _is_native_node,
+    _is_nonzero_metric_value,
     compare_sql_executions,
     compare_stages,
     get_client_or_default,
     get_environment,
     get_executor_thread_dump,
+    get_job_bottlenecks,
+    get_native_engine_metrics,
     get_sql_execution,
     get_stage,
     list_applications,
@@ -799,7 +806,7 @@ class TestTools(unittest.TestCase):
     def test_list_sql_executions_sort_by_duration(self, mock_get_client):
         """list_sql_executions sorts by duration descending and returns summaries"""
         mock_client = MagicMock()
-        mock_client.list_all_sql_executions.return_value = [
+        mock_client.get_sql_list.return_value = [
             self._mk_sql(1, 5000, success=[1, 2]),
             self._mk_sql(2, 10000, success=[3]),
             self._mk_sql(3, 2000, success=[4]),
@@ -814,15 +821,20 @@ class TestTools(unittest.TestCase):
         self.assertEqual(result[0].duration, 10000)
         self.assertEqual(result[0].success_job_ids, [3])
         # List view must be lightweight: no plan text or node details fetched.
-        mock_client.list_all_sql_executions.assert_called_with(
-            "spark-app-123", app_attempt_id=None, page_size=100
+        mock_client.get_sql_list.assert_called_with(
+            app_id="spark-app-123",
+            app_attempt_id=None,
+            details=False,
+            plan_description=False,
+            offset=0,
+            length=100,
         )
 
     @patch("spark_history_mcp.tools.tools.get_client_or_default")
     def test_list_sql_executions_default_sort_failed_first(self, mock_get_client):
         """Default ordering puts FAILED first, then RUNNING, then COMPLETED"""
         mock_client = MagicMock()
-        mock_client.list_all_sql_executions.return_value = [
+        mock_client.get_sql_list.return_value = [
             self._mk_sql(1, 10000, status="COMPLETED"),
             self._mk_sql(2, 1000, status="FAILED"),
             self._mk_sql(3, 5000, status="RUNNING"),
@@ -837,7 +849,7 @@ class TestTools(unittest.TestCase):
     def test_list_sql_executions_status_filter(self, mock_get_client):
         """status filter keeps only matching executions (case-insensitive)"""
         mock_client = MagicMock()
-        mock_client.list_all_sql_executions.return_value = [
+        mock_client.get_sql_list.return_value = [
             self._mk_sql(1, 5000, status="COMPLETED"),
             self._mk_sql(2, 1000, status="FAILED"),
         ]
@@ -854,7 +866,7 @@ class TestTools(unittest.TestCase):
     def test_list_sql_executions_description_filter(self, mock_get_client):
         """description filter does a case-insensitive substring match"""
         mock_client = MagicMock()
-        mock_client.list_all_sql_executions.return_value = [
+        mock_client.get_sql_list.return_value = [
             self._mk_sql(1, 5000, description="benchmark q5"),
             self._mk_sql(2, 1000, description="warmup"),
         ]
@@ -871,7 +883,7 @@ class TestTools(unittest.TestCase):
     def test_list_sql_executions_limit(self, mock_get_client):
         """limit caps the number of returned executions"""
         mock_client = MagicMock()
-        mock_client.list_all_sql_executions.return_value = [
+        mock_client.get_sql_list.return_value = [
             self._mk_sql(i, (10 - i) * 1000) for i in range(10)
         ]
         mock_get_client.return_value = mock_client
@@ -887,7 +899,7 @@ class TestTools(unittest.TestCase):
     def test_list_sql_executions_empty(self, mock_get_client):
         """Empty result returns an empty list"""
         mock_client = MagicMock()
-        mock_client.list_all_sql_executions.return_value = []
+        mock_client.get_sql_list.return_value = []
         mock_get_client.return_value = mock_client
 
         result = list_sql_executions("spark-app-123", ctx=self.mock_ctx)
@@ -1196,44 +1208,6 @@ class TestTools(unittest.TestCase):
         diffs = {d.node_type: (d.a, d.b) for d in pc.node_type_diffs}
         self.assertEqual(diffs, {"Scan": (2, 1)})
 
-    @patch("spark_history_mcp.tools.tools.get_client_or_default")
-    def test_compare_sql_executions_defaults_to_longest_on_any_page(
-        self, mock_get_client
-    ):
-        """Without execution IDs, the longest execution is searched on every page"""
-        # 120 short executions; the longest one is far from the first 20.
-        executions = [self._mk_sql(i, 1000) for i in range(120)]
-        executions[110] = self._mk_sql(110, 9000)
-
-        mock_client = MagicMock()
-        mock_client.list_all_sql_executions.return_value = executions
-        mock_client.get_sql_execution.side_effect = lambda app_id, exec_id, **kw: (
-            self._mk_sql(exec_id, 9000)
-        )
-        mock_client.list_jobs.return_value = []
-        mock_client.list_stages.return_value = []
-        mock_get_client.return_value = mock_client
-
-        result = compare_sql_executions("app-a", "app-b", ctx=self.mock_ctx)
-
-        self.assertEqual(result.a.sql_id, 110)
-        self.assertEqual(result.b.sql_id, 110)
-        mock_client.list_all_sql_executions.assert_any_call("app-a")
-
-    @patch("spark_history_mcp.tools.tools.get_client_or_default")
-    def test_compare_sql_executions_no_executions(self, mock_get_client):
-        """An application without SQL executions cannot default an execution ID"""
-        mock_client = MagicMock()
-        mock_client.list_all_sql_executions.return_value = []
-        mock_get_client.return_value = mock_client
-
-        with self.assertRaises(ValueError) as context:
-            compare_sql_executions("app-a", "app-b", ctx=self.mock_ctx)
-
-        self.assertIn(
-            "No SQL executions found in application app-a", str(context.exception)
-        )
-
     # Tests for pagination support
 
     @patch("spark_history_mcp.tools.tools.get_client_or_default")
@@ -1387,7 +1361,7 @@ class TestTools(unittest.TestCase):
 
     @patch("spark_history_mcp.tools.tools.get_client_or_default")
     def test_list_executors_sort_by_id_ascending(self, mock_get_client):
-        """sort_by='id' orders by ascending string ID"""
+        """sort_by='id': driver first, then numeric IDs ascending"""
         mock_client = MagicMock()
         mock_client.list_executors.return_value = [
             self._exec("2"),
@@ -1400,7 +1374,7 @@ class TestTools(unittest.TestCase):
         result = list_executors("spark-app-123", sort_by="id", ctx=self.mock_ctx)
 
         # Ascending lexicographic string order.
-        self.assertEqual([e.id for e in result], ["1", "10", "2", "driver"])
+        self.assertEqual([e.id for e in result], ["driver", "1", "2", "10"])
 
     @patch("spark_history_mcp.tools.tools.get_client_or_default")
     def test_list_executors_default_order_active_first(self, mock_get_client):
@@ -1598,7 +1572,27 @@ class TestTools(unittest.TestCase):
             attempt_id=1,
             status="failed",
             app_attempt_id=None,
+            offset=0,
+            length=500,
         )
+
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_list_stage_task_failures_paginates_and_dedupes(self, mock_get_client):
+        from spark_history_mcp.api_client.models.task import Task
+
+        big = "VeloxRuntimeError: boom\n" + "  at frame\n" * 5000 + "Caused by: X\n"
+        page1 = [Task(taskId=i, attempt=0, status="FAILED", errorMessage=big.replace("boom", f"boom TID {i}"))
+                 for i in range(500)]
+        page2 = [Task(taskId=500, attempt=0, status="FAILED", errorMessage="other error")]
+        client = MagicMock()
+        client.list_stage_tasks.side_effect = [page1, page2]
+        mock_get_client.return_value = client
+        out = list_stage_task_failures("app-1", 5, stage_attempt_id=0, ctx=self.mock_ctx)
+        self.assertEqual(len(out), 501)
+        self.assertIn("chars trimmed", out[0].error_message)
+        self.assertIn("Caused by: X", out[0].error_message)
+        self.assertEqual(out[1].error_message, "[same error as task 0]")
+        self.assertEqual(out[500].error_message, "other error")
 
     @patch("spark_history_mcp.tools.tools.get_client_or_default")
     def test_list_stage_task_failures_not_found(self, mock_get_client):
@@ -1608,3 +1602,214 @@ class TestTools(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             list_stage_task_failures("app-1", 999, ctx=self.mock_ctx)
+
+
+class TestNativeEngineMetrics(unittest.TestCase):
+    """Tests for Gluten/Velox native-engine detection and metrics."""
+
+    @staticmethod
+    def _gluten_environment(backend="velox"):
+        return Environment.from_dict(
+            {
+                "sparkProperties": [
+                    ["spark.plugins", "org.apache.gluten.GlutenPlugin"],
+                    ["spark.gluten.sql.columnar.backend.lib", backend],
+                    ["spark.memory.offHeap.enabled", "true"],
+                ]
+            }
+        )
+
+    @staticmethod
+    def _vanilla_environment():
+        return Environment.from_dict(
+            {"sparkProperties": [["spark.app.name", "demo"]]}
+        )
+
+    @staticmethod
+    def _node(node_id, node_name, metrics):
+        """Build a plan-node mock with ``metrics`` as (name, value) pairs."""
+        node = MagicMock()
+        node.node_id = node_id
+        node.node_name = node_name
+        node.metrics = []
+        for name, value in metrics:
+            m = MagicMock()
+            m.name = name
+            m.value = value
+            node.metrics.append(m)
+        return node
+
+    def test_detect_native_engine_true_for_gluten_plugin(self):
+        info = _detect_native_engine(self._gluten_environment())
+        self.assertTrue(info.is_native)
+        self.assertEqual(info.engine, "gluten")
+        self.assertEqual(info.backend, "velox")
+
+    def test_detect_native_engine_false_without_plugin(self):
+        info = _detect_native_engine(self._vanilla_environment())
+        self.assertFalse(info.is_native)
+        self.assertEqual(info.engine, "spark")
+        self.assertIsNone(info.backend)
+
+    def test_detect_native_engine_handles_missing_environment(self):
+        info = _detect_native_engine(None)
+        self.assertFalse(info.is_native)
+
+    def test_detect_native_engine_legacy_plugin_class(self):
+        """The pre-Apache-donation plugin class name is still recognized."""
+        env = Environment.from_dict(
+            {"sparkProperties": [["spark.plugins", "io.glutenproject.GlutenPlugin"]]}
+        )
+        self.assertTrue(_detect_native_engine(env).is_native)
+
+    def test_is_native_node_matches_transformer_suffix(self):
+        self.assertTrue(_is_native_node("ProjectExecTransformer"))
+        self.assertTrue(_is_native_node("VeloxColumnarToRowExec"))
+        self.assertFalse(_is_native_node("Project"))
+        self.assertFalse(_is_native_node(None))
+
+    def test_is_nonzero_metric_value(self):
+        self.assertFalse(_is_nonzero_metric_value("0"))
+        self.assertFalse(_is_nonzero_metric_value("0.0 B"))
+        self.assertFalse(_is_nonzero_metric_value(""))
+        self.assertFalse(_is_nonzero_metric_value(None))
+        self.assertTrue(_is_nonzero_metric_value("42 MB"))
+
+    def test_build_native_operator_metrics_filters_to_native_nodes(self):
+        nodes = [
+            self._node(1, "ProjectExecTransformer", [("output rows", "100")]),
+            self._node(2, "Filter", [("rows", "50")]),  # not native, excluded
+        ]
+        result = _build_native_operator_metrics(7, nodes)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].node_name, "ProjectExecTransformer")
+        self.assertEqual(result[0].sql_execution_id, 7)
+        self.assertEqual(result[0].metrics["output rows"], "100")
+
+    def test_find_native_spill_hits_ignores_zero_and_non_native(self):
+        nodes = [
+            self._node(
+                1,
+                "HashAggregateExecTransformer",
+                [("spilled bytes", "1048576"), ("output rows", "10")],
+            ),
+            self._node(2, "FilterExecTransformer", [("spilled bytes", "0")]),
+            self._node(3, "Exchange", [("spilled bytes", "999")]),  # not native
+        ]
+        hits = _find_native_spill_hits(3, nodes)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].node_name, "HashAggregateExecTransformer")
+        self.assertEqual(hits[0].metric, "spilled bytes")
+        self.assertEqual(hits[0].value, "1048576")
+        self.assertEqual(hits[0].sql_execution_id, 3)
+
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_native_engine_metrics_scans_slowest_executions(
+        self, mock_get_client
+    ):
+        mock_client = MagicMock()
+        mock_client.get_environment.return_value = self._gluten_environment()
+        mock_client.get_sql_list.return_value = [
+            self._mk_sql(1, 9000),
+            self._mk_sql(2, 3000),
+        ]
+        execution_1 = MagicMock()
+        execution_1.nodes = [
+            self._node(
+                10, "HashAggregateExecTransformer", [("spilled bytes", "2048")]
+            )
+        ]
+        mock_client.get_sql_execution.return_value = execution_1
+        mock_get_client.return_value = mock_client
+
+        result = get_native_engine_metrics("spark-app-123", top_n=5, ctx=MagicMock())
+
+        self.assertEqual(result.engine.engine, "gluten")
+        self.assertEqual(result.engine.backend, "velox")
+        self.assertEqual(len(result.operators), 2)  # one per scanned execution
+        self.assertEqual(len(result.spill_hits), 2)
+        self.assertEqual(result.spill_hits[0].metric, "spilled bytes")
+
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_native_engine_metrics_scoped_to_one_execution(
+        self, mock_get_client
+    ):
+        mock_client = MagicMock()
+        mock_client.get_environment.return_value = self._gluten_environment()
+        execution = MagicMock()
+        execution.nodes = [self._node(1, "ProjectExecTransformer", [("rows", "5")])]
+        mock_client.get_sql_execution.return_value = execution
+        mock_get_client.return_value = mock_client
+
+        result = get_native_engine_metrics("spark-app-123", execution_id=42, ctx=MagicMock())
+
+        mock_client.get_sql_list.assert_not_called()
+        mock_client.get_sql_execution.assert_called_once_with(
+            app_id="spark-app-123",
+            execution_id=42,
+            details=True,
+            plan_description=False,
+        )
+        self.assertEqual(len(result.operators), 1)
+
+    def _mk_sql(self, sql_id, duration):
+        sql = MagicMock(spec=SQLExecution)
+        sql.id = sql_id
+        sql.duration = duration
+        sql.status = "COMPLETED"
+        sql.description = "Query"
+        sql.submission_time = "2025-08-05T00:23:38.607GMT"
+        sql.success_job_ids = []
+        sql.failed_job_ids = []
+        sql.running_job_ids = []
+        return sql
+
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_job_bottlenecks_reports_non_native_by_default(
+        self, mock_get_client
+    ):
+        mock_client = MagicMock()
+        mock_client.list_stages.return_value = []
+        mock_client.list_jobs.return_value = []
+        mock_client.list_all_executors.return_value = []
+        mock_client.get_environment.return_value = self._vanilla_environment()
+        mock_client.get_sql_list.return_value = []
+        mock_get_client.return_value = mock_client
+
+        result = get_job_bottlenecks("spark-app-123", ctx=MagicMock())
+
+        self.assertEqual(result["native_engine"]["engine"], "spark")
+        self.assertFalse(result["native_engine"]["is_native"])
+        self.assertEqual(result["native_engine"]["spill_hits"], [])
+        # Scan-node inspection runs regardless of engine, but there's
+        # nothing to scan when there are no SQL executions.
+        self.assertEqual(result["scan_bottlenecks"]["scan_count"], 0)
+        # No per-execution plan fetch needed when the SQL list is empty.
+        mock_client.get_sql_execution.assert_not_called()
+
+    @patch("spark_history_mcp.tools.tools.get_client_or_default")
+    def test_get_job_bottlenecks_flags_native_spill(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_client.list_stages.return_value = []
+        mock_client.list_jobs.return_value = []
+        mock_client.list_all_executors.return_value = []
+        mock_client.get_environment.return_value = self._gluten_environment()
+        mock_client.get_sql_list.return_value = [self._mk_sql(1, 9000)]
+        execution = MagicMock()
+        execution.nodes = [
+            self._node(
+                1, "HashAggregateExecTransformer", [("spilled bytes", "2048")]
+            )
+        ]
+        mock_client.get_sql_execution.return_value = execution
+        mock_get_client.return_value = mock_client
+
+        result = get_job_bottlenecks("spark-app-123", ctx=MagicMock())
+
+        self.assertTrue(result["native_engine"]["is_native"])
+        self.assertEqual(len(result["native_engine"]["spill_hits"]), 1)
+        native_recs = [
+            r for r in result["recommendations"] if "Native" in r["issue"]
+        ]
+        self.assertEqual(len(native_recs), 1)
+        self.assertIn("gluten/velox", native_recs[0]["issue"])

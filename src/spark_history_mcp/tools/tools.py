@@ -1,5 +1,6 @@
 import heapq
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
@@ -15,6 +16,10 @@ from spark_history_mcp.api_client.models.stage_data import StageData
 from spark_history_mcp.core.app import tool
 from spark_history_mcp.models.mcp_types import (
     FailedTask,
+    NativeEngineInfo,
+    NativeEngineMetrics,
+    NativeEngineSpillHit,
+    NativeOperatorMetrics,
     SqlCompareSide,
     SqlExecutionComparison,
     SqlExecutionDetail,
@@ -165,6 +170,8 @@ def _aggregate_stages(
         if (stage_ids is not None and sid not in stage_ids) or sid in seen:
             continue
         seen.add(sid)
+        if stage.status == "SKIPPED":  # never ran; its num_tasks are phantom
+            continue
         agg.stage_count += 1
         agg.tasks += stage.num_tasks or 0
         agg.duration += _duration_ms(stage.submission_time, stage.completion_time)
@@ -186,6 +193,8 @@ def _sort_sql_executions(
         return sorted(executions, key=duration, reverse=True)
     if sort_by == "id":
         return sorted(executions, key=lambda e: e.id or 0, reverse=True)
+    if sort_by is not None:
+        raise ValueError(f"invalid sort_by {sort_by!r}; expected 'duration' or 'id'")
     # default: failed first, then by duration descending
     return sorted(
         executions,
@@ -261,8 +270,12 @@ def _sort_executors(
     if sort_by == "gc":
         return sorted(executors, key=lambda e: e.total_gc_time or 0, reverse=True)
     if sort_by == "id":
-        # Ascending string comparison (IDs are "driver", "1", "2", ...).
-        return sorted(executors, key=lambda e: e.id or "")
+        # "driver" first, then numeric ids ascending ("2" before "10").
+        return sorted(
+            executors,
+            key=lambda e: (0, 0, "") if e.id == "driver"
+            else (1, int(e.id), "") if (e.id or "").isdigit() else (2, 0, e.id or ""),
+        )
     if sort_by is not None:
         raise ValueError(
             f"invalid sort_by {sort_by!r}; expected 'failed-tasks', 'duration', 'gc', or 'id'"
@@ -278,8 +291,132 @@ def _count_node_types(nodes) -> Dict[str, int]:
     """Count plan nodes by node name."""
     counts: Dict[str, int] = {}
     for node in nodes or []:
-        counts[node.node_name] = counts.get(node.node_name, 0) + 1
+        # Scan names embed the table ("Scan parquet spark_catalog.db.t") and
+        # Spark 3.5 adds the catalog prefix -- compare operator types only.
+        name = re.sub(r"^((?:\w*Scan\w*) \w+) .*", r"\1", node.node_name or "")
+        counts[name] = counts.get(name, 0) + 1
     return counts
+
+
+# Gluten replaces its plugin class name when the project moved under the
+# Apache umbrella; accept both so older event logs are still detected.
+_GLUTEN_PLUGIN_CLASSES = (
+    "io.glutenproject.glutenplugin",
+    "org.apache.gluten.glutenplugin",
+)
+_GLUTEN_BACKEND_CONF_KEY = "spark.gluten.sql.columnar.backend.lib"
+
+# Gluten's "*Transformer" naming convention (ProjectExecTransformer,
+# HashAggregateExecTransformer, ...) is stable across its Velox and
+# ClickHouse backends, as are its columnar<->row conversion node names.
+# Bare "ColumnarToRow"/"RowToColumnar" are NOT native: vanilla Spark emits
+# ColumnarToRow for its own vectorized Parquet/ORC reader. Gluten's
+# conversions are prefixed (VeloxColumnarToRow, RowToVeloxColumnar,
+# CHColumnarToRow ...), which "velox"/the CH prefix below still catch.
+_NATIVE_NODE_PATTERN = re.compile(
+    r"transformer|velox|nativefilescan|\bch(columnartorow|rowtocolumnar)", re.IGNORECASE
+)
+_SPILL_METRIC_PATTERN = re.compile(r"spill", re.IGNORECASE)
+_ZERO_METRIC_VALUE_PATTERN = re.compile(r"^0(\.0+)?(\s*[a-zA-Z]+)?$")
+
+
+def _detect_native_engine(env: Optional[Environment]) -> NativeEngineInfo:
+    """Detect whether an application ran on the Gluten/Velox native engine.
+
+    Gluten offloads SQL execution to a native backend (typically Velox) via a
+    Spark plugin registered in ``spark.plugins``. When active, most physical
+    plan operators are replaced with native "*Transformer" nodes whose
+    metrics (spill, native memory, native wall time) only show up in the SQL
+    plan node metrics -- not in the standard JVM stage/task fields the rest
+    of this module otherwise relies on.
+    """
+    props = dict(env.spark_properties or []) if env else {}
+    plugins = {p.strip().lower() for p in (props.get("spark.plugins") or "").split(",") if p.strip()}
+    is_native = any(p in plugins for p in _GLUTEN_PLUGIN_CLASSES) or any(
+        "gluten" in p for p in plugins
+    )
+    backend = (props.get(_GLUTEN_BACKEND_CONF_KEY) or "").strip().lower() or None
+    return NativeEngineInfo(
+        engine="gluten" if is_native else "spark",
+        backend=backend,
+        is_native=is_native,
+    )
+
+
+def _is_native_node(node_name: Optional[str]) -> bool:
+    return bool(node_name and _NATIVE_NODE_PATTERN.search(node_name))
+
+
+# Multi-task SQL metrics render as
+#   "total (min, med, max (stageId: taskId))\n0.0 B (0.0 B, 0.0 B, 0.0 B (stage 6.0: task 3771))"
+# -- only the leading total decides whether anything happened.
+_METRIC_TOTAL_HEADER_RE = re.compile(r"^total \(min, med, max[^\n]*?\)\)\s*", re.IGNORECASE)
+
+
+def _metric_total(value: Optional[str]) -> str:
+    v = _METRIC_TOTAL_HEADER_RE.sub("", (value or "").strip())
+    return v.split(" (", 1)[0].strip()
+
+
+def _is_nonzero_metric_value(value: Optional[str]) -> bool:
+    v = _metric_total(value)
+    return bool(v) and not _ZERO_METRIC_VALUE_PATTERN.match(v)
+
+
+def _build_native_operator_metrics(
+    execution_id: Optional[int], nodes
+) -> List[NativeOperatorMetrics]:
+    """Curated per-operator metrics for the native (Gluten/Velox) nodes in a
+    SQL plan, in the same shape as ``_build_node_metrics`` but filtered down
+    to native operators only."""
+    result: List[NativeOperatorMetrics] = []
+    for n in nodes or []:
+        if not _is_native_node(n.node_name) or not n.metrics:
+            continue
+        metrics: Dict[str, str] = {}
+        for m in n.metrics:
+            metrics[m.name] = " ".join((m.value or "").split())
+        if metrics:
+            result.append(
+                NativeOperatorMetrics(
+                    sql_execution_id=execution_id,
+                    node_id=n.node_id,
+                    node_name=n.node_name,
+                    metrics=metrics,
+                )
+            )
+    return result
+
+
+def _find_native_spill_hits(
+    execution_id: Optional[int], nodes
+) -> List[NativeEngineSpillHit]:
+    """Find non-zero spill-related metrics on native operators.
+
+    Native (e.g. Velox) spill is invisible to the standard stage-level
+    ``memoryBytesSpilled``/``diskBytesSpilled`` fields, so this is the only
+    way to detect it for Gluten/Velox jobs.
+    """
+    hits: List[NativeEngineSpillHit] = []
+    for n in nodes or []:
+        if not _is_native_node(n.node_name):
+            continue
+        for m in n.metrics or []:
+            if (
+                m.name
+                and _SPILL_METRIC_PATTERN.search(m.name)
+                and _is_nonzero_metric_value(m.value)
+            ):
+                hits.append(
+                    NativeEngineSpillHit(
+                        sql_execution_id=execution_id,
+                        node_id=n.node_id,
+                        node_name=n.node_name,
+                        metric=m.name,
+                        value=" ".join((m.value or "").split()),
+                    )
+                )
+    return hits
 
 
 def get_client_or_default(
@@ -386,7 +523,13 @@ def list_applications(
         all_apps = []
         clients = ctx.request_context.lifespan_context.clients
 
+        seen_urls = set()
         for server_name, client in clients.items():
+            url = getattr(getattr(client, "config", None), "url", None)
+            if isinstance(url, str):
+                if url.rstrip("/") in seen_urls:
+                    continue  # alias of a server already listed
+                seen_urls.add(url.rstrip("/"))
             try:
                 apps = client.list_applications(
                     status=status,
@@ -603,13 +746,17 @@ def get_stage(
     return stage_data
 
 
-def _resolve_latest_stage_attempt_id(client, app_id: str, stage_id: int) -> int:
+def _resolve_latest_stage_attempt_id(
+    client, app_id: str, stage_id: int, app_attempt_id: Optional[str] = None
+) -> int:
     """Return the highest attempt id for a stage, or raise if the stage is absent."""
+    kwargs = {"app_attempt_id": app_attempt_id} if app_attempt_id else {}
     attempts = client.list_stage_attempts(
         app_id=app_id,
         stage_id=stage_id,
         details=False,
         with_summaries=False,
+        **kwargs,
     )
     if not attempts:
         raise ValueError(
@@ -626,6 +773,7 @@ def list_stage_task_failures(
     server: Optional[str] = None,
     stage_attempt_id: Optional[int] = None,
     app_attempt_id: Optional[str] = None,
+    full_messages: bool = False,
     *,
     ctx: Context,
 ) -> list:
@@ -640,8 +788,12 @@ def list_stage_task_failures(
 
     Only tasks with status ``FAILED`` are returned. By default the latest stage
     attempt is inspected; pass ``stage_attempt_id`` to target a specific one.
-    The full, untruncated ``error_message`` is preserved so the complete stack
-    trace is available.
+    Every failed task is returned (paginated, not the server's default 20).
+    Native (Velox) stack traces can be ~65KB each and are usually identical
+    across tasks, so by default each message is trimmed to its head plus all
+    "Caused by" lines, and a task whose message repeats an earlier one gets
+    ``"[same error as task N]"`` instead. Pass ``full_messages=True`` for the
+    complete text of every task.
 
     Args:
         app_id: The Spark application ID.
@@ -650,6 +802,8 @@ def list_stage_task_failures(
         stage_attempt_id: Specific stage attempt to inspect; defaults to the
             latest attempt.
         app_attempt_id: YARN application attempt ID; uses the latest if omitted.
+        full_messages: Return every task's untrimmed error message (can be
+            hundreds of thousands of tokens on native failures)
 
     Returns:
         A list of ``FailedTask`` objects, one per failed task, each with
@@ -662,27 +816,69 @@ def list_stage_task_failures(
     client = get_client_or_default(ctx, server, app_id)
 
     if stage_attempt_id is None:
-        stage_attempt_id = _resolve_latest_stage_attempt_id(client, app_id, stage_id)
-
-    tasks = client.list_stage_tasks(
-        app_id=app_id,
-        stage_id=stage_id,
-        attempt_id=stage_attempt_id,
-        status="failed",
-        app_attempt_id=app_attempt_id,
-    )
-
-    return [
-        FailedTask(
-            task_id=t.task_id,
-            attempt=t.attempt,
-            executor_id=t.executor_id,
-            host=t.host,
-            status=t.status,
-            error_message=t.error_message,
+        stage_attempt_id = _resolve_latest_stage_attempt_id(
+            client, app_id, stage_id, app_attempt_id
         )
-        for t in tasks
-    ]
+
+    page = 500
+    tasks: list = []
+    while True:
+        batch = client.list_stage_tasks(
+            app_id=app_id,
+            stage_id=stage_id,
+            attempt_id=stage_attempt_id,
+            status="failed",
+            app_attempt_id=app_attempt_id,
+            offset=len(tasks),
+            length=page,
+        )
+        tasks.extend(batch or [])
+        if not batch or len(batch) < page:
+            break
+
+    first_task_for: Dict[str, Any] = {}
+    out = []
+    for t in tasks:
+        msg = t.error_message
+        if msg and not full_messages:
+            key = _error_signature(msg)
+            if key in first_task_for:
+                msg = f"[same error as task {first_task_for[key]}]"
+            else:
+                first_task_for[key] = t.task_id
+                msg = _trim_error_message(msg)
+        out.append(
+            FailedTask(
+                task_id=t.task_id,
+                attempt=t.attempt,
+                executor_id=t.executor_id,
+                host=t.host,
+                status=t.status,
+                error_message=msg,
+            )
+        )
+    return out
+
+
+# Numbers (ids, addresses, and the per-task memory figures in Velox's
+# memory-pool dump, with their units) vary between otherwise identical errors.
+_ERR_VOLATILE_RE = re.compile(r"0x[0-9a-f]+|\d[\d.,]*(?:\s*[KMGTPE]i?B\b)?", re.I)
+
+
+def _error_signature(msg: str) -> str:
+    """Error identity ignoring numbers and whitespace runs."""
+    return " ".join(_ERR_VOLATILE_RE.sub("#", msg[:2000]).split())
+
+
+def _trim_error_message(msg: str, head_chars: int = 3000, max_causes: int = 10) -> str:
+    if len(msg) <= head_chars:
+        return msg
+    head = msg[:head_chars]
+    causes = [ln.strip() for ln in msg[head_chars:].splitlines() if ln.lstrip().startswith("Caused by")]
+    tail = "\n".join(causes[:max_causes])
+    return f"{head}\n... [{len(msg) - head_chars} chars trimmed; full_messages=True for all]" + (
+        f"\n{tail}" if tail else ""
+    )
 
 
 # Environment sections that can be requested individually via ``section``.
@@ -730,6 +926,7 @@ def get_environment(
     server: Optional[str] = None,
     app_attempt_id: Optional[str] = None,
     section: Optional[str] = None,
+    key_filter: Optional[str] = None,
     *,
     ctx: Context,
 ):
@@ -746,7 +943,13 @@ def get_environment(
         section: Optional section filter to return only one part of the
             environment. One of "runtime", "spark_properties",
             "system_properties", "hadoop_properties", "metrics_properties", or
-            "classpath_entries". When omitted, all sections are returned.
+            "classpath_entries", or "all". When omitted, everything EXCEPT
+            hadoop_properties and classpath_entries is returned -- those two
+            are ~85% of the payload (~22K tokens on a Dataproc app) and are
+            rarely what you're looking for; request them explicitly.
+        key_filter: Optional case-insensitive substring; keeps only property
+            / classpath entries whose key or value contains it (e.g.
+            "spark.gluten.dp" or "memory"). Applies to every returned section.
 
     Returns:
         ApplicationEnvironmentInfo object containing environment details. When
@@ -756,10 +959,34 @@ def get_environment(
 
     env = client.get_environment(app_id=app_id, app_attempt_id=app_attempt_id)
 
-    if section is not None:
+    if section is not None and section.strip().lower() != "all":
         env = _filter_environment_section(env, section)
+    elif section is None:
+        env = env.model_copy(deep=True)
+        env.hadoop_properties = None
+        env.classpath_entries = None
+
+    if key_filter:
+        env = _filter_environment_keys(env, key_filter)
 
     return env
+
+
+def _filter_environment_keys(env: Environment, key_filter: str) -> Environment:
+    """Keep only [key, value] entries where key or value contains key_filter."""
+    needle = key_filter.lower()
+    filtered = env.model_copy(deep=True)
+    for env_field in _ENVIRONMENT_SECTION_FIELDS:
+        if env_field == "runtime":
+            continue
+        pairs = getattr(filtered, env_field, None)
+        if pairs:
+            setattr(
+                filtered,
+                env_field,
+                [p for p in pairs if any(needle in str(x).lower() for x in p)],
+            )
+    return filtered
 
 
 @tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -866,7 +1093,9 @@ def _filter_threads(threads, state, name, blocked_only):
             continue
         if name_low and name_low not in (t.thread_name or "").lower():
             continue
-        if blocked_only and t.blocked_by_thread_id is None and t.lock_name is None:
+        # lock_name is set for any parked/waiting thread on Spark 3.5+, so it
+        # can't signal contention.
+        if blocked_only and t.thread_state != "BLOCKED" and t.blocked_by_thread_id is None:
             continue
         result.append(t)
     return result
@@ -891,10 +1120,8 @@ def get_executor_thread_dump(
     lock/blocking information, and full stack trace. Use ``executor_id="driver"``
     for the driver.
 
-    Only a live Spark UI (the driver of a **running** application) serves
-    thread dumps; the Spark History Server returns an error for every
-    application. Pass ``server`` to target a server configured with the
-    driver UI URL.
+    The application must be **running**: completed applications return an error
+    because the Spark History Server does not persist thread dumps.
 
     Args:
         app_id: The Spark application ID
@@ -923,7 +1150,14 @@ def get_executor_thread_dump(
 
 @tool(annotations=ToolAnnotations(readOnlyHint=True))
 def compare_job_environments(
-    app_id1: str, app_id2: str, server: Optional[str] = None, *, ctx: Context
+    app_id1: str,
+    app_id2: str,
+    server: Optional[str] = None,
+    server2: Optional[str] = None,
+    include_common: bool = False,
+    key_filter: Optional[str] = None,
+    *,
+    ctx: Context,
 ) -> Dict[str, Any]:
     """
     Compare Spark environment configurations between two jobs.
@@ -934,13 +1168,21 @@ def compare_job_environments(
     Args:
         app_id1: First Spark application ID
         app_id2: Second Spark application ID
-        server: Optional server name to use (uses default if not specified)
+        server: Optional server name for app_id1 (uses default if not specified)
+        server2: Optional server name for app_id2 (defaults to ``server``) --
+            set it to compare runs on different History Servers, e.g. a
+            deb11 app against a deb12 app
+        include_common: Also return every identical spark property (off by
+            default: on a Dataproc app that's ~3.5K tokens of no signal; a
+            ``common_count`` is always returned)
+        key_filter: Optional case-insensitive substring to restrict the
+            spark-property comparison to matching keys (e.g. "spark.gluten")
 
     Returns:
         Dictionary containing configuration differences and similarities
     """
     client1 = get_client_or_default(ctx, server, app_id1)
-    client2 = get_client_or_default(ctx, server, app_id2)
+    client2 = get_client_or_default(ctx, server2 or server, app_id2)
 
     env1 = client1.get_environment(app_id=app_id1)
     env2 = client2.get_environment(app_id=app_id2)
@@ -950,12 +1192,21 @@ def compare_job_environments(
 
     spark_props1 = props_to_dict(env1.spark_properties)
     spark_props2 = props_to_dict(env2.spark_properties)
+    if key_filter:
+        needle = key_filter.lower()
+        spark_props1 = {k: v for k, v in spark_props1.items() if needle in k.lower()}
+        spark_props2 = {k: v for k, v in spark_props2.items() if needle in k.lower()}
 
     system_props1 = props_to_dict(env1.system_properties)
     system_props2 = props_to_dict(env2.system_properties)
 
     comparison = {
-        "applications": {"app1": app_id1, "app2": app_id2},
+        "applications": {
+            "app1": app_id1,
+            "app2": app_id2,
+            "server1": server,
+            "server2": server2 or server,
+        },
         "runtime_comparison": {
             "app1": {
                 "java_version": env1.runtime.java_version,
@@ -1005,6 +1256,10 @@ def compare_job_environments(
         },
     }
 
+    common = comparison["spark_properties"]["common"]
+    comparison["spark_properties"]["common_count"] = len(common)
+    if not include_common:
+        del comparison["spark_properties"]["common"]
     return comparison
 
 
@@ -1042,7 +1297,12 @@ def _calc_executor_summary_from_client(client, app_id: str):
 
 @tool(annotations=ToolAnnotations(readOnlyHint=True))
 def compare_job_performance(
-    app_id1: str, app_id2: str, server: Optional[str] = None, *, ctx: Context
+    app_id1: str,
+    app_id2: str,
+    server: Optional[str] = None,
+    server2: Optional[str] = None,
+    *,
+    ctx: Context,
 ) -> Dict[str, Any]:
     """
     Compare performance metrics between two Spark jobs.
@@ -1054,12 +1314,14 @@ def compare_job_performance(
         app_id1: First Spark application ID
         app_id2: Second Spark application ID
         server: Optional server name to use (uses default if not specified)
+        server2: Optional server for app_id2 when it lives on a different
+            History Server (e.g. deb11 vs deb12); defaults to server
 
     Returns:
         Dictionary containing detailed performance comparison
     """
     client1 = get_client_or_default(ctx, server, app_id1)
-    client2 = get_client_or_default(ctx, server, app_id2)
+    client2 = get_client_or_default(ctx, server2 or server, app_id2)
 
     # Define API calls for parallel execution
     api_calls = [
@@ -1165,8 +1427,6 @@ def compare_job_performance(
             "comparison": {
                 "executor_count_ratio": exec_summary2["total_executors"]
                 / max(exec_summary1["total_executors"], 1),
-                "memory_usage_ratio": exec_summary2["memory_used"]
-                / max(exec_summary1["memory_used"], 1),
                 "task_completion_ratio": exec_summary2["completed_tasks"]
                 / max(exec_summary1["completed_tasks"], 1),
                 "gc_time_ratio": exec_summary2["total_gc_time"]
@@ -1179,27 +1439,38 @@ def compare_job_performance(
             "comparison": {
                 "job_count_ratio": job_stats2["count"] / max(job_stats1["count"], 1),
                 "avg_duration_ratio": job_stats2["avg_duration"]
-                / max(job_stats1["avg_duration"], 1)
+                / job_stats1["avg_duration"]
                 if job_stats1["avg_duration"] > 0
-                else 0,
+                else None,
                 "total_duration_ratio": job_stats2["total_duration"]
-                / max(job_stats1["total_duration"], 1)
+                / job_stats1["total_duration"]
                 if job_stats1["total_duration"] > 0
-                else 0,
+                else None,
             },
         },
     }
 
+    # Standalone-only fields; all null on YARN/Dataproc -- don't spend tokens.
+    if not any(v for side in comparison["resource_allocation"].values() for v in side.values()):
+        del comparison["resource_allocation"]
     return comparison
 
 
 def _resolve_longest_sql_id(client, app_id: str, execution_id: Optional[int]) -> int:
-    """Resolve a SQL execution id, defaulting to the longest-running execution."""
+    """Resolve a SQL execution id, defaulting to the longest-running execution.
+
+    Must scan every execution, not just the server's default first page of
+    20 (see ``_fetch_all_sql_executions``) -- otherwise "longest running"
+    silently degrades to "longest running among the first 20."
+    """
     if execution_id is not None:
         return execution_id
-    executions = client.list_all_sql_executions(app_id)
-    if executions:
-        return max(executions, key=lambda x: x.duration or 0).id
+    sql_list = _fetch_all_sql_executions(client, app_id)
+    # Orphaned RUNNING executions in completed apps report a duration that
+    # keeps growing with the wall clock; prefer finished ones.
+    finished = [e for e in sql_list if (e.status or "").upper() != "RUNNING"]
+    if finished or sql_list:
+        return max(finished or sql_list, key=lambda x: x.duration or 0).id
     raise ValueError(f"No SQL executions found in application {app_id}")
 
 
@@ -1332,6 +1603,43 @@ def _build_node_metrics(nodes) -> List[SqlNodeMetrics]:
     return result
 
 
+def _fetch_all_sql_executions(
+    client,
+    app_id: str,
+    app_attempt_id: Optional[str] = None,
+    page_size: int = 100,
+) -> List[SQLExecution]:
+    """Fetch every SQL execution for an app, paginating past the server's
+    default page size.
+
+    ``SparkRestClient.get_sql_list`` (and the raw History Server ``/sql``
+    endpoint it wraps) defaults to returning only the first 20 executions
+    when called without an explicit ``length``. Any caller that needs to
+    reason about "all executions" -- not just "the first page" -- must call
+    this instead of ``client.get_sql_list(...)`` directly, or it will
+    silently miss executions past index 20 (e.g. picking the wrong "longest
+    running" execution because the real longest one was execution #25).
+    """
+    all_executions: List[SQLExecution] = []
+    offset = 0
+    while True:
+        page: List[SQLExecution] = client.get_sql_list(
+            app_id=app_id,
+            app_attempt_id=app_attempt_id,
+            details=False,
+            plan_description=False,
+            offset=offset,
+            length=page_size,
+        )
+        if not page:
+            break
+        all_executions.extend(page)
+        offset += page_size
+        if len(page) < page_size:
+            break
+    return all_executions
+
+
 @tool(annotations=ToolAnnotations(readOnlyHint=True))
 def list_sql_executions(
     app_id: str,
@@ -1372,8 +1680,8 @@ def list_sql_executions(
     if limit < 0:
         raise ValueError("limit must be non-negative")
 
-    all_executions = client.list_all_sql_executions(
-        app_id, app_attempt_id=app_attempt_id, page_size=page_size
+    all_executions = _fetch_all_sql_executions(
+        client, app_id, app_attempt_id=app_attempt_id, page_size=page_size
     )
 
     if description:
@@ -1493,6 +1801,64 @@ def get_sql_execution(
     return detail
 
 
+def _jobs_and_stage_agg_for_executions(
+    client, app_id: str, executions: List[SQLExecution]
+) -> tuple:
+    """Union the jobs (and their stages) across one or more SQL executions.
+
+    A single logical operation can be split across sibling SQL execution IDs
+    by the planner -- e.g. a DataSourceV2 ``SaveIntoDataSourceCommand``
+    wrapper execution with zero jobs of its own, whose actual work runs
+    under a second, immediately-following execution ID. Passing every
+    execution in the group here aggregates their jobs/stages together,
+    rather than silently reporting zero stage metrics for the wrapper.
+    """
+    job_ids: set = set()
+    for execution in executions:
+        job_ids |= set(_collect_sql_job_ids(execution))
+    all_jobs = client.list_jobs(app_id=app_id)
+    jobs = [j for j in all_jobs if j.job_id in job_ids]
+    stage_ids = _stage_ids_from_jobs(jobs)
+    all_stages = client.list_stages(app_id=app_id)
+    agg = _aggregate_stages(all_stages, stage_ids)
+    return jobs, stage_ids, agg, all_stages
+
+
+def _collect_sql_compare_side(
+    client, app_id: str, execution_id: int, extra_executions: Optional[List[SQLExecution]] = None
+) -> SqlCompareSide:
+    """Build one side of a SQL-execution comparison.
+
+    ``extra_executions`` lets callers fold sibling executions' jobs/stages
+    into the aggregate (see ``_jobs_and_stage_agg_for_executions``) while
+    still reporting ``execution_id``'s own duration/description/status as
+    the side's headline figure.
+    """
+    execution = client.get_sql_execution(
+        app_id, execution_id, details=False, plan_description=False
+    )
+    jobs, _stage_ids, agg, _all_stages = _jobs_and_stage_agg_for_executions(
+        client, app_id, [execution, *(extra_executions or [])]
+    )
+
+    return SqlCompareSide(
+        app=app_id,
+        sql_id=execution.id,
+        description=execution.description,
+        status=execution.status,
+        duration=execution.duration,
+        jobs=len(jobs),
+        stages=agg.stage_count,
+        tasks=agg.tasks,
+        stage_time=agg.duration,
+        input_bytes=agg.input_bytes,
+        shuffle_read_bytes=agg.shuffle_read_bytes,
+        shuffle_write_bytes=agg.shuffle_write_bytes,
+        disk_bytes_spilled=agg.disk_bytes_spilled,
+        jvm_gc_time=agg.jvm_gc_time,
+    )
+
+
 @tool(annotations=ToolAnnotations(readOnlyHint=True))
 def compare_sql_executions(
     app_id1: str,
@@ -1500,6 +1866,7 @@ def compare_sql_executions(
     execution_id1: Optional[int] = None,
     execution_id2: Optional[int] = None,
     server: Optional[str] = None,
+    server2: Optional[str] = None,
     include_plan_diff: bool = False,
     *,
     ctx: Context,
@@ -1521,6 +1888,8 @@ def compare_sql_executions(
         execution_id1: Execution ID for the first app (uses longest-running if omitted)
         execution_id2: Execution ID for the second app (uses longest-running if omitted)
         server: Optional server name to use (uses default if not specified)
+        server2: Optional server for app_id2 when it lives on a different
+            History Server (e.g. deb11 vs deb12); defaults to server
         include_plan_diff: Also compare the SQL plan structure (default False)
 
     Returns:
@@ -1528,42 +1897,14 @@ def compare_sql_executions(
         ``plan_comparison`` when ``include_plan_diff`` is set
     """
     client1 = get_client_or_default(ctx, server, app_id1)
-    client2 = get_client_or_default(ctx, server, app_id2)
+    client2 = get_client_or_default(ctx, server2 or server, app_id2)
 
     execution_id1 = _resolve_longest_sql_id(client1, app_id1, execution_id1)
     execution_id2 = _resolve_longest_sql_id(client2, app_id2, execution_id2)
 
-    def collect_side(client, app_id: str, execution_id: int) -> SqlCompareSide:
-        execution = client.get_sql_execution(
-            app_id, execution_id, details=False, plan_description=False
-        )
-        job_ids = set(_collect_sql_job_ids(execution))
-        all_jobs = client.list_jobs(app_id=app_id)
-        jobs = [j for j in all_jobs if j.job_id in job_ids]
-        stage_ids = _stage_ids_from_jobs(jobs)
-        all_stages = client.list_stages(app_id=app_id)
-        agg = _aggregate_stages(all_stages, stage_ids)
-
-        return SqlCompareSide(
-            app=app_id,
-            sql_id=execution.id,
-            description=execution.description,
-            status=execution.status,
-            duration=execution.duration,
-            jobs=len(jobs),
-            stages=agg.stage_count,
-            tasks=agg.tasks,
-            stage_time=agg.duration,
-            input_bytes=agg.input_bytes,
-            shuffle_read_bytes=agg.shuffle_read_bytes,
-            shuffle_write_bytes=agg.shuffle_write_bytes,
-            disk_bytes_spilled=agg.disk_bytes_spilled,
-            jvm_gc_time=agg.jvm_gc_time,
-        )
-
     comparison = SqlExecutionComparison(
-        a=collect_side(client1, app_id1, execution_id1),
-        b=collect_side(client2, app_id2, execution_id2),
+        a=_collect_sql_compare_side(client1, app_id1, execution_id1),
+        b=_collect_sql_compare_side(client2, app_id2, execution_id2),
     )
 
     if include_plan_diff:
@@ -1656,6 +1997,7 @@ def compare_stages(
     app_id2: str,
     stage_id2: int,
     server: Optional[str] = None,
+    server2: Optional[str] = None,
     *,
     ctx: Context,
 ) -> StageComparison:
@@ -1677,16 +2019,82 @@ def compare_stages(
         app_id2: Application ID for the second stage
         stage_id2: Stage ID within the second application
         server: Optional server name to use (uses default if not specified)
+        server2: Optional server for app_id2 when it lives on a different
+            History Server (e.g. deb11 vs deb12); defaults to server
 
     Returns:
         StageComparison with an ``a`` and ``b`` side
     """
     client1 = get_client_or_default(ctx, server, app_id1)
-    client2 = get_client_or_default(ctx, server, app_id2)
+    client2 = get_client_or_default(ctx, server2 or server, app_id2)
 
     return StageComparison(
         a=_collect_stage_side(client1, app_id1, stage_id1),
         b=_collect_stage_side(client2, app_id2, stage_id2),
+    )
+
+
+@tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_native_engine_metrics(
+    app_id: str,
+    server: Optional[str] = None,
+    execution_id: Optional[int] = None,
+    top_n: int = 5,
+    *,
+    ctx: Context,
+) -> NativeEngineMetrics:
+    """
+    Get Gluten/Velox native-engine metrics for a Spark application.
+
+    Detects whether the application ran on a native SQL engine (Gluten,
+    typically backed by Velox) via ``spark.plugins``/``spark.gluten.*``
+    config, then surfaces the per-operator metrics reported by the native
+    "*Transformer" plan nodes -- these carry native execution details (e.g.
+    spill, peak memory, wall time) that never reach the standard JVM
+    stage/task metrics used elsewhere in this server.
+
+    Args:
+        app_id: The Spark application ID
+        server: Optional server name to use (uses default if not specified)
+        execution_id: Optional SQL execution ID to scope to. When omitted,
+            the ``top_n`` slowest SQL executions are scanned instead.
+        top_n: Number of slowest SQL executions to scan when execution_id is
+            not given (default: 5)
+
+    Returns:
+        NativeEngineMetrics with engine detection, per-operator native
+        metrics, and any non-zero spill metrics found on native operators
+    """
+    client = get_client_or_default(ctx, server, app_id)
+
+    engine_info = _detect_native_engine(client.get_environment(app_id=app_id))
+
+    if execution_id is not None:
+        sql_ids = [execution_id]
+    else:
+        sql_ids = [
+            s.id
+            for s in list_sql_executions(
+                app_id, server=server, sort_by="duration", limit=top_n,
+                ctx=ctx,
+            )
+            if s.id is not None
+        ]
+
+    operators: List[NativeOperatorMetrics] = []
+    spill_hits: List[NativeEngineSpillHit] = []
+    for sql_id in sql_ids:
+        execution = client.get_sql_execution(
+            app_id=app_id, execution_id=sql_id, details=True, plan_description=False
+        )
+        operators.extend(_build_native_operator_metrics(sql_id, execution.nodes))
+        spill_hits.extend(_find_native_spill_hits(sql_id, execution.nodes))
+
+    return NativeEngineMetrics(
+        application_id=app_id,
+        engine=engine_info,
+        operators=operators,
+        spill_hits=spill_hits,
     )
 
 
@@ -1698,7 +2106,10 @@ def get_job_bottlenecks(
     Identify performance bottlenecks in a Spark job.
 
     Analyzes stages, tasks, and executors to find the most time-consuming
-    operations and resource-intensive components.
+    operations and resource-intensive components. Also inspects scan
+    operators in the slowest SQL executions (native or vanilla, BigQuery or
+    file-based) for BigQuery scan counts and file-based scans that evaluated
+    filters without pushing them down to the source.
 
     Args:
         app_id: The Spark application ID
@@ -1710,17 +2121,14 @@ def get_job_bottlenecks(
     """
     client = get_client_or_default(ctx, server, app_id)
 
-    slowest_stages = list_stages(
-        app_id, server=server, sort_by="duration", length=top_n, ctx=ctx
-    )
+    all_stages = client.list_stages(app_id=app_id)
+    slowest_stages = _sort_stages(list(all_stages), "duration")[:top_n]
 
     slowest_jobs = list_jobs(
         app_id, server=server, sort_by="duration", length=top_n, ctx=ctx
     )
 
     exec_summary = get_executor_summary(app_id, server, ctx=ctx)
-
-    all_stages = client.list_stages(app_id=app_id)
 
     # Identify stages with high spill
     high_spill_stages = []
@@ -1751,6 +2159,58 @@ def get_job_bottlenecks(
         if exec_summary["total_duration"] > 0
         else 0
     )
+
+    # Detect a native SQL engine (Gluten/Velox). When active, most operators
+    # run outside the JVM as "*Transformer" nodes, so the standard
+    # memory_bytes_spilled/GC-time signals above miss native spill and
+    # understate native memory pressure. Native spill only shows up in the
+    # SQL plan node metrics, so pull it from the slowest SQL executions.
+    try:
+        engine_info = _detect_native_engine(
+            client.get_environment(app_id=app_id)
+        )
+    except Exception:
+        engine_info = NativeEngineInfo()
+
+    # Lazy import: tools.py <-> scan_nodes.py would otherwise be a circular
+    # module-load dependency (scan_nodes.py imports several helpers from
+    # this module).
+    from spark_history_mcp.tools.scan_nodes import collect_scan_nodes
+
+    native_spill_hits: List[NativeEngineSpillHit] = []
+    scan_nodes_found: List[Any] = []
+    for sql_summary in list_sql_executions(
+        app_id, server=server, sort_by="duration", limit=top_n,
+        ctx=ctx,
+    ):
+        if sql_summary.id is None:
+            continue
+        execution = client.get_sql_execution(
+            app_id=app_id,
+            execution_id=sql_summary.id,
+            details=True,
+            plan_description=True,
+        )
+        if engine_info.is_native:
+            native_spill_hits.extend(
+                _find_native_spill_hits(sql_summary.id, execution.nodes)
+            )
+        scan_nodes_found.extend(
+            collect_scan_nodes(
+                sql_summary.id, execution.nodes, execution.plan_description or ""
+            )
+        )
+
+    # File-based scans (Parquet/ORC/etc, native or vanilla) where Spark
+    # evaluated filters (DataFilters) but none were pushed down to the
+    # source (PushedFilters empty) -- a missed pushdown opportunity. Not
+    # meaningful for BigQuery scans, which never report pushdown info in
+    # the plan text regardless of whether it happened.
+    missed_pushdown_scans = [
+        n
+        for n in scan_nodes_found
+        if n.source_kind == "file" and n.data_filters and not n.pushed_filters
+    ]
 
     bottlenecks = {
         "application_id": app_id,
@@ -1784,12 +2244,23 @@ def get_job_bottlenecks(
         "resource_bottlenecks": {
             "memory_spill_stages": high_spill_stages[:top_n],
             "gc_pressure_ratio": gc_pressure,
-            "executor_utilization": {
-                "total_executors": exec_summary["total_executors"],
-                "active_executors": exec_summary["active_executors"],
-                "utilization_ratio": exec_summary["active_executors"]
-                / max(exec_summary["total_executors"], 1),
-            },
+        },
+        "native_engine": {
+            "engine": engine_info.engine,
+            "backend": engine_info.backend,
+            "is_native": engine_info.is_native,
+            "spill_hits": [
+                hit.model_dump(by_alias=True) for hit in native_spill_hits[: top_n * 5]
+            ],
+        },
+        "scan_bottlenecks": {
+            "scan_count": len(scan_nodes_found),
+            "bigquery_scan_count": sum(
+                1 for n in scan_nodes_found if n.source_kind == "bigquery"
+            ),
+            "missed_pushdown_scans": [
+                n.model_dump(by_alias=True) for n in missed_pushdown_scans[:top_n]
+            ],
         },
         "recommendations": [],
     }
@@ -1801,7 +2272,16 @@ def get_job_bottlenecks(
                 "type": "memory",
                 "priority": "high",
                 "issue": f"High GC pressure ({gc_pressure:.1%})",
-                "suggestion": "Consider increasing executor memory or reducing memory usage",
+                "suggestion": (
+                    "Consider increasing executor memory or reducing memory usage"
+                    if not engine_info.is_native
+                    else (
+                        "JVM GC pressure is a weak signal under the "
+                        f"{engine_info.engine}/{engine_info.backend or 'native'} "
+                        "engine since most execution happens off-heap; check "
+                        "native_engine.spill_hits and executor off-heap memory too"
+                    )
+                ),
             }
         )
 
@@ -1815,6 +2295,24 @@ def get_job_bottlenecks(
             }
         )
 
+    if native_spill_hits:
+        bottlenecks["recommendations"].append(
+            {
+                "type": "memory",
+                "priority": "high",
+                "issue": (
+                    f"Native ({engine_info.engine}/{engine_info.backend or 'native'}) "
+                    f"spill detected in {len(native_spill_hits)} operator metric(s) "
+                    "not reflected in the standard stage spill fields above"
+                ),
+                "suggestion": (
+                    "Increase spark.memory.offHeap.size / off-heap memory available "
+                    "to the native engine, or reduce per-task data volume "
+                    "(e.g. more partitions) to avoid native spilling"
+                ),
+            }
+        )
+
     if exec_summary["failed_tasks"] > 0:
         bottlenecks["recommendations"].append(
             {
@@ -1822,6 +2320,24 @@ def get_job_bottlenecks(
                 "priority": "medium",
                 "issue": f"{exec_summary['failed_tasks']} failed tasks",
                 "suggestion": "Investigate task failures and consider increasing task retry settings",
+            }
+        )
+
+    if missed_pushdown_scans:
+        tables = sorted({n.table for n in missed_pushdown_scans if n.table})
+        bottlenecks["recommendations"].append(
+            {
+                "type": "io",
+                "priority": "medium",
+                "issue": (
+                    f"{len(missed_pushdown_scans)} file scan(s) evaluated filters "
+                    f"that were not pushed down to the source: {', '.join(tables) or 'unknown table(s)'}"
+                ),
+                "suggestion": (
+                    "Check predicate types/expressions on these scans -- some "
+                    "aren't supported for pushdown by this source or engine, so "
+                    "more data than necessary is read before filtering"
+                ),
             }
         )
 
@@ -1912,52 +2428,59 @@ def get_resource_usage_timeline(
                 }
             )
 
-    # Sort events by timestamp
-    timeline_events.sort(key=lambda x: x["timestamp"])
+    timeline_events.sort(key=lambda x: (x["timestamp"] is None, x["timestamp"] or 0))
 
-    # Calculate resource utilization over time
-    active_executors = 0
-    total_cores = 0
-    total_memory = 0
-
-    resource_timeline = []
-
+    # Track live executors by id so removals give back their cores/memory.
+    live: Dict[str, tuple] = {}
+    running_stages = peak_stages = 0
+    peak_executors = peak_cores = 0
+    executor_timeline = []
     for event in timeline_events:
-        if event["type"] == "executor_add":
-            active_executors += 1
-            total_cores += event["cores"]
-            total_memory += event["memory_mb"]
-        elif event["type"] == "executor_remove":
-            active_executors -= 1
-            # Note: We don't have cores/memory info in remove events
-
-        resource_timeline.append(
+        kind = event["type"]
+        if kind == "executor_add":
+            live[event["executor_id"]] = (event["cores"] or 0, event["memory_mb"] or 0)
+        elif kind == "executor_remove":
+            live.pop(event["executor_id"], None)
+        elif kind == "stage_start":
+            running_stages += 1
+            peak_stages = max(peak_stages, running_stages)
+            continue
+        else:
+            running_stages = max(0, running_stages - 1)
+            continue
+        cores = sum(c for c, _ in live.values())
+        peak_executors = max(peak_executors, len(live))
+        peak_cores = max(peak_cores, cores)
+        executor_timeline.append(
             {
-                "timestamp": event["timestamp"],
-                "active_executors": active_executors,
-                "total_cores": total_cores,
-                "total_memory_mb": total_memory,
-                "event": event,
+                "t": str(event["timestamp"]),
+                "event": kind,
+                "executor_id": event["executor_id"],
+                "live_executors": len(live),
+                "live_cores": cores,
+                **({"reason": event["reason"]} if event.get("reason") else {}),
             }
         )
 
+    max_rows = 200
     return {
         "application_id": app_id,
         "application_name": app.name,
         "summary": {
             "total_events": len(timeline_events),
-            "executor_additions": len(
-                [e for e in timeline_events if e["type"] == "executor_add"]
-            ),
-            "executor_removals": len(
-                [e for e in timeline_events if e["type"] == "executor_remove"]
-            ),
-            "stage_executions": len(
-                [e for e in timeline_events if e["type"] == "stage_start"]
-            ),
-            "peak_executors": max(
-                [r["active_executors"] for r in resource_timeline] + [0]
-            ),
-            "peak_cores": max([r["total_cores"] for r in resource_timeline] + [0]),
+            "executor_additions": sum(e["type"] == "executor_add" for e in timeline_events),
+            "executor_removals": sum(e["type"] == "executor_remove" for e in timeline_events),
+            "stage_executions": sum(e["type"] == "stage_start" for e in timeline_events),
+            "peak_executors": peak_executors,
+            "peak_cores": peak_cores,
+            "peak_concurrent_stages": peak_stages,
         },
+        # Executor add/remove only (stage events are summarized above);
+        # capped so dynamic-allocation apps don't flood the context.
+        "executor_timeline": executor_timeline[:max_rows],
+        **(
+            {"executor_timeline_truncated": len(executor_timeline) - max_rows}
+            if len(executor_timeline) > max_rows
+            else {}
+        ),
     }

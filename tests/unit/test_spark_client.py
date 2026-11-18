@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from spark_history_mcp.api.spark_client import SparkRestClient
+from spark_history_mcp.api.spark_client import AttemptRequiredError, SparkRestClient
 from spark_history_mcp.api_client.exceptions import (
     ForbiddenException,
     NotFoundException,
@@ -11,7 +11,6 @@ from spark_history_mcp.api_client.models.application import Application
 from spark_history_mcp.api_client.models.application_attempt import ApplicationAttempt
 from spark_history_mcp.api_client.models.executor import Executor
 from spark_history_mcp.api_client.models.job import Job
-from spark_history_mcp.api_client.models.sql_execution import SQLExecution
 from spark_history_mcp.config.config import ServerConfig
 
 
@@ -152,23 +151,23 @@ class TestSparkRestClient(unittest.TestCase):
         with self.assertRaises(NotFoundException):
             self.client.list_jobs("app-123")
 
-    def test_missing_attempt_retries_latest_attempt(self):
-        # YARN applications have named attempts even when there is only one;
-        # without an attempt id the History Server returns 404.
-        self.mock_api.list_jobs.side_effect = [NotFoundException(status=404), ["job"]]
+    def test_missing_attempt_raises_attempt_required(self):
+        self.mock_api.list_jobs.side_effect = NotFoundException(status=404)
         self.mock_api.get_application.return_value = Application(
             id="app-123",
             name="multi",
             attempts=[
-                ApplicationAttempt(attemptId="9"),
-                ApplicationAttempt(attemptId="10"),
+                ApplicationAttempt(attemptId="2"),
+                ApplicationAttempt(attemptId="1"),
             ],
         )
 
-        self.assertEqual(self.client.list_jobs("app-123"), ["job"])
+        with self.assertRaises(AttemptRequiredError) as ctx:
+            self.client.list_jobs("app-123")
 
-        retry = self.mock_api.list_jobs.call_args_list[1]
-        self.assertEqual(retry.args[0], "app-123/10")
+        message = str(ctx.exception)
+        self.assertIn("multiple attempts (2, 1)", message)
+        self.assertIn("app_attempt_id='2'", message)
 
     def test_404_with_explicit_attempt_not_enriched(self):
         self.mock_api.list_jobs.side_effect = NotFoundException(status=404)
@@ -214,44 +213,34 @@ class TestSparkRestClient(unittest.TestCase):
             client._api.api_client.configuration.proxy, "socks5h://localhost:8157"
         )
 
-    def test_list_all_sql_executions_pages_through_everything(self):
-        executions = [SQLExecution(id=i) for i in range(250)]
-        self.mock_api.list_sql_executions.side_effect = (
-            lambda app_path, details, plan_description, offset, length, **kw: (
-                executions[offset : offset + length]
-            )
+    def test_download_event_log_overrides_accept_header(self):
+        """A real Spark History Server 406s on the OpenAPI-declared
+        "Accept: application/zip" (only application/octet-stream or no
+        Accept header is actually negotiated) -- verified against a live
+        server, so this override must stay in place."""
+        self.mock_api.download_logs.return_value = b"zip-bytes"
+
+        result = self.client.download_event_log("app-1")
+
+        self.assertEqual(result, b"zip-bytes")
+        self.mock_api.download_logs.assert_called_once_with(
+            "app-1",
+            _request_timeout=self.timeout,
+            _headers={"Accept": "application/octet-stream"},
         )
 
-        result = self.client.list_all_sql_executions("app-1", page_size=100)
+    def test_download_event_log_with_attempt_id(self):
+        self.mock_api.download_attempt_logs.return_value = b"zip-bytes"
 
-        self.assertEqual([e.id for e in result], list(range(250)))
-        offsets = [
-            c.kwargs["offset"] for c in self.mock_api.list_sql_executions.call_args_list
-        ]
-        self.assertEqual(offsets, [0, 100, 200])
-        for c in self.mock_api.list_sql_executions.call_args_list:
-            self.assertFalse(c.kwargs["details"])
-            self.assertFalse(c.kwargs["plan_description"])
-            self.assertEqual(c.kwargs["length"], 100)
+        result = self.client.download_event_log("app-1", app_attempt_id="2")
 
-    def test_list_all_sql_executions_stops_after_full_last_page(self):
-        executions = [SQLExecution(id=i) for i in range(200)]
-        self.mock_api.list_sql_executions.side_effect = (
-            lambda app_path, details, plan_description, offset, length, **kw: (
-                executions[offset : offset + length]
-            )
+        self.assertEqual(result, b"zip-bytes")
+        self.mock_api.download_attempt_logs.assert_called_once_with(
+            "app-1",
+            "2",
+            _request_timeout=self.timeout,
+            _headers={"Accept": "application/octet-stream"},
         )
-
-        result = self.client.list_all_sql_executions("app-1", page_size=100)
-
-        self.assertEqual(len(result), 200)
-        self.assertEqual(self.mock_api.list_sql_executions.call_count, 3)
-
-    def test_list_all_sql_executions_empty(self):
-        self.mock_api.list_sql_executions.return_value = []
-
-        self.assertEqual(self.client.list_all_sql_executions("app-1"), [])
-        self.mock_api.list_sql_executions.assert_called_once()
 
 
 class TestCookieAuth(unittest.TestCase):

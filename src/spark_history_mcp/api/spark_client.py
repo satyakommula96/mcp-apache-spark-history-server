@@ -21,13 +21,15 @@ a request is rejected with 401/403.
 
 import functools
 import inspect
+import json
 import threading
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from spark_history_mcp.api_client.api.default_api import DefaultApi
 from spark_history_mcp.api_client.api_client import ApiClient
 from spark_history_mcp.api_client.configuration import Configuration
 from spark_history_mcp.api_client.exceptions import (
+    ApiException,
     ForbiddenException,
     NotFoundException,
     UnauthorizedException,
@@ -57,18 +59,12 @@ class AttemptRequiredError(Exception):
     """
 
 
-def _attempt_order(attempt_id: str) -> tuple[int, str]:
-    """Sorts attempt ids numerically where they are numbers ("10" after "9")."""
-    return (int(attempt_id), "") if attempt_id.isdigit() else (-1, attempt_id)
-
-
 def _resilient_call(method):
     """Cross-cutting error handling for application-scoped methods.
 
     * On 401/403, if a re-auth callback is configured, refresh the cookie and
       retry once (covers EMR session-cookie rotation).
     * On 404 with no ``app_attempt_id`` for an app that has named attempts,
-      retry once with the latest attempt when the method accepts one, else
       re-raise as :class:`AttemptRequiredError`; otherwise propagate. The
       attempt lookup only happens on the failure path.
     """
@@ -91,11 +87,6 @@ def _resilient_call(method):
                 raise
             app_id = bound.arguments.get("app_id")
             attempts = self._attempt_ids(app_id) if app_id else []
-            if attempts and "app_attempt_id" in signature.parameters:
-                # YARN apps always have named attempts, even with only one.
-                # Default to the latest, as the History Server's UI does.
-                bound.arguments["app_attempt_id"] = max(attempts, key=_attempt_order)
-                return method(*bound.args, **bound.kwargs)
             if attempts:
                 raise AttemptRequiredError(
                     f"Application '{app_id}' has multiple attempts "
@@ -427,9 +418,9 @@ class SparkRestClient:
     ) -> List[ThreadStackTrace]:
         """Get the JVM thread dump for a driver or executor.
 
-        Use ``"driver"`` for the driver. Only a live Spark UI (the driver of a
-        running application) serves thread dumps; the History Server responds
-        with 503 for every application.
+        Use ``"driver"`` for the driver. The application must be running;
+        completed applications return 404 because the History Server does not
+        persist thread dumps.
         """
         app_path = self._app_path(app_id, app_attempt_id)
         return self._invoke(self._api.get_executor_threads, app_path, executor_id)
@@ -445,6 +436,73 @@ class SparkRestClient:
         app_path = self._app_path(app_id, app_attempt_id)
         return self._invoke(self._api.get_environment, app_path)
 
+    @_resilient_call
+    def download_event_log(
+        self, app_id: str, app_attempt_id: Optional[str] = None
+    ) -> bytes:
+        """Download the raw event log(s) for an application as zip bytes.
+
+        Only the built-in Spark listener events are parsed into the other
+        REST endpoints; custom listener events (e.g. Gluten's
+        DPQueryCostDecisionEvent, GlutenPlanFallbackEvent) are only visible
+        by reading this raw log directly.
+        """
+        # The generated client requests "Accept: application/zip" per the
+        # OpenAPI spec, but a real Spark History Server 406s on that exact
+        # value -- it only negotiates application/octet-stream (or no
+        # Accept header at all). Override it here rather than in the spec,
+        # since this is a server quirk, not a schema error.
+        headers = {"Accept": "application/octet-stream"}
+        if app_attempt_id:
+            return self._invoke(
+                self._api.download_attempt_logs,
+                app_id,
+                app_attempt_id,
+                _headers=headers,
+            )
+        return self._invoke(self._api.download_logs, app_id, _headers=headers)
+
+    @_resilient_call
+    def get_gluten_ui_summary(
+        self, app_id: str, app_attempt_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch the Gluten History Server UI plugin's JSON summary.
+
+        ``GlutenSQLHistoryServerPlugin`` (gluten-ui) replays Gluten's custom
+        listener events into the History Server's own store and serves its
+        "Gluten SQL / DataFrame" tab page as JSON at
+        ``/history/<app>[/<attempt>]/gluten/json/`` -- per-execution Gluten/
+        fallback node counts and fallback reasons, plus Gluten build info.
+        This is outside ``/api/v1``, so it goes through the raw HTTP client
+        (same auth headers/cookie) rather than the generated API.
+
+        Returns ``None`` when the History Server doesn't have the plugin
+        (404, or a non-JSON response), so callers can fall back to reading
+        the raw event log.
+        """
+        api_client = self._api.api_client
+        url = (
+            f"{self.config.url.rstrip('/')}/history/"
+            f"{self._app_path(app_id, app_attempt_id)}/gluten/json/"
+        )
+        headers = {**api_client.default_headers, "Accept": "application/json"}
+        if api_client.cookie:
+            headers["Cookie"] = api_client.cookie
+        resp = api_client.call_api(
+            "GET", url, header_params=headers, _request_timeout=self.timeout
+        )
+        resp.read()
+        if resp.status == 404:
+            return None
+        if resp.status >= 400:
+            body = resp.data.decode("utf-8", "replace") if resp.data else None
+            raise ApiException.from_response(http_resp=resp, body=body, data=None)
+        try:
+            data = json.loads(resp.data)
+        except (TypeError, ValueError):
+            return None
+        return data if isinstance(data, dict) and "queries" in data else None
+
     # ------------------------------------------------------------------
     # SQL
     # ------------------------------------------------------------------
@@ -458,7 +516,15 @@ class SparkRestClient:
         offset: int = 0,
         length: int = 20,
     ) -> List[SQLExecution]:
-        """List SQL executions for an application (pagination is server-side)."""
+        """List SQL executions for an application (pagination is server-side).
+
+        WARNING: ``length`` defaults to 20 -- a real query execution can sit
+        well past that (e.g. execution #25 of 26). A caller that needs
+        "every execution," not just the first page, must either pass an
+        explicit ``length`` large enough to cover it or loop on ``offset``
+        (see ``tools._fetch_all_sql_executions`` for the paginating
+        version). Do not assume this returns everything.
+        """
         app_path = self._app_path(app_id, app_attempt_id)
         return self._invoke(
             self._api.list_sql_executions,
@@ -468,38 +534,6 @@ class SparkRestClient:
             offset=offset,
             length=length,
         )
-
-    def list_all_sql_executions(
-        self,
-        app_id: str,
-        app_attempt_id: Optional[str] = None,
-        page_size: int = 100,
-    ) -> List[SQLExecution]:
-        """List every SQL execution of an application, one page at a time.
-
-        The History Server paginates the SQL list (20 executions unless a
-        length is given), so a single ``get_sql_list`` call can miss
-        executions. The executions are lightweight: no plan text and no node
-        details.
-        """
-        executions: List[SQLExecution] = []
-        offset = 0
-        while True:
-            page = self.get_sql_list(
-                app_id=app_id,
-                app_attempt_id=app_attempt_id,
-                details=False,
-                plan_description=False,
-                offset=offset,
-                length=page_size,
-            )
-            if not page:
-                break
-            executions.extend(page)
-            offset += page_size
-            if len(page) < page_size:
-                break
-        return executions
 
     @_resilient_call
     def get_sql_execution(

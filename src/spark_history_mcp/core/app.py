@@ -14,8 +14,6 @@ from mcp import MCPError
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from spark_history_mcp.api.emr_persistent_ui_client import EMRPersistentUIClient
 from spark_history_mcp.api.spark_client import SparkRestClient
@@ -75,6 +73,15 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
 
         if server_config.default:
             default_client = clients[name]
+
+    # Local History Servers started earlier via start_history_server keep
+    # running across MCP restarts; re-register the ones still up.
+    from spark_history_mcp.tools.local_shs import restore_registered
+
+    try:
+        restore_registered(clients)
+    except Exception:  # noqa: S110 -- never block startup on this
+        pass
 
     app_discovery = ApplicationDiscovery(clients)
     yield AppContext(
@@ -161,16 +168,6 @@ mcp: MCPServer[Any] = MCPServer(
 )
 
 
-@mcp.custom_route("/health", methods=["GET"])
-async def health(_request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
-
-
-@mcp.custom_route("/ready", methods=["GET"])
-async def ready(_request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
-
-
 def _with_error_text(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Keep the SDK 1.x error text, which SDK 2.x hides unless it is a ToolError."""
     if inspect.iscoroutinefunction(fn):
@@ -212,4 +209,11 @@ def tool(**kwargs: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
 
 # Import tools and prompts to register them with MCP
 from spark_history_mcp.prompts import prompts  # noqa: E402,F401
-from spark_history_mcp.tools import tools  # noqa: E402,F401
+from spark_history_mcp.tools import (  # noqa: E402,F401
+    local_shs,
+    native_engine,
+    regression,
+    scan_nodes,
+    tools,
+    workflow,
+)

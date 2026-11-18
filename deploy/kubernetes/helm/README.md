@@ -188,8 +188,6 @@ ingress:
         - spark-mcp.company.com
 ```
 
-The ingress hosts are added to the Host/Origin allowlist automatically (see 8 below).
-
 #### 5. Monitoring and Observability
 ```yaml
 monitoring:
@@ -260,30 +258,6 @@ networkPolicy:
       - protocol: TCP
         port: 18888
 ```
-
-#### 8. Host and Origin Allowlist (DNS Rebinding Protection)
-
-The server rejects a request when its `Host` header (HTTP 421) or `Origin` header (HTTP 403) is not allowed. The chart allows these names, each with and without a port:
-
-- `localhost`, `127.0.0.1`, `[::1]` (for `kubectl port-forward`)
-- The Service DNS names: `<name>`, `<name>.<namespace>`, `<name>.<namespace>.svc`, `<name>.<namespace>.svc.<clusterDomain>`
-- `ingress.hosts`, when `ingress.enabled` is true
-
-Add other names, for example a NodePort or LoadBalancer address:
-
-```yaml
-clusterDomain: cluster.local  # change if your cluster uses a different DNS domain
-
-config:
-  transportSecurity:
-    enabled: true
-    allowedHosts:
-      - "203.0.113.10:*"   # "name:*" matches any port; "name" matches no port
-    allowedOrigins:
-      - "https://mcp-gateway.example.com"
-```
-
-`SHS_MCP__TRANSPORT_SECURITY__*` variables in `env` override these values.
 
 ### Environment-Specific Values
 
@@ -408,8 +382,6 @@ kubectl run test-pod --rm -i --tty --image=curlimages/curl -- sh
 curl http://mcp-apache-spark-history-server:18888/health
 ```
 
-An HTTP 421 response (`Invalid Host header`) means that the `Host` header is not in the allowlist. Add the name to `config.transportSecurity.allowedHosts` (see Configuration, example 8).
-
 ### Debug Mode
 
 Enable debug mode for troubleshooting:
@@ -502,10 +474,10 @@ spec:
 
 ## 📚 Additional Resources
 
-- [Kubernetes Documentation](../../../README.md#-kubernetes-deployment) - Detailed K8s deployment guide
-- [Values Reference](mcp-apache-spark-history-server/values.yaml) - Complete values documentation
-- [Templates](mcp-apache-spark-history-server/templates/) - Kubernetes manifest templates
-- [Examples](#common-configuration-examples) - Real-world configuration examples
+- [Kubernetes Documentation](../README.md) - Detailed K8s deployment guide
+- [Values Reference](values.yaml) - Complete values documentation
+- [Templates](templates/) - Kubernetes manifest templates
+- [Examples](examples/) - Real-world configuration examples
 
 ## 🤝 Contributing
 

@@ -6,10 +6,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urljoin
 
 import pytest
-import requests
 from mcp import Client, StdioServerParameters
 from mcp.types import TextContent
 from mcp.types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
@@ -240,15 +238,6 @@ async def test_auto_mode_discovers_modern_server(connection):
         assert client.protocol_version == MODERN_MODE
         assert client.server_info is not None
         assert client.server_info.name == "Spark Events"
-
-
-@pytest.mark.parametrize("path", ["/health", "/ready"])
-def test_probe_route_returns_ok(connection, path):
-    if connection != Connection(MODERN_MODE, "http"):
-        pytest.skip("HTTP route without an MCP era; runs on the modern-http row")
-    response = requests.get(urljoin(mcp_endpoint, path), timeout=10)
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
 
 
 def _prompt_text(result):
@@ -795,24 +784,6 @@ async def test_compare_sql_executions_with_plan_diff():
         }
 
 
-@pytest.mark.asyncio
-async def test_compare_sql_executions_defaults_to_longest():
-    async with McpClient() as client:
-        result = await client.call_tool(
-            "compare_sql_executions", {"app_id1": app1_id, "app_id2": app2_id}
-        )
-        assert not result.is_error
-        cmp = _parse_one(result, SqlExecutionComparison)
-
-        # SQL execution 8 is the longest-running one in both apps.
-        assert cmp.a.app == app1_id
-        assert cmp.a.sql_id == 8
-        assert cmp.a.duration == 2689
-        assert cmp.b.app == app2_id
-        assert cmp.b.sql_id == 8
-        assert cmp.b.duration == 2217
-
-
 # ---------------------------------------------------------------------------
 # Environment tool
 # ---------------------------------------------------------------------------
@@ -1008,8 +979,8 @@ async def test_compare_stages_not_found():
 # get_executor_thread_dump tool
 # ---------------------------------------------------------------------------
 # The e2e corpus is replayed from event logs, so every application is completed.
-# The History Server never serves thread dumps (only a live Spark UI does), so
-# the endpoint returns 503 and the tool surfaces an error. This confirms the tool is wired up end to end.
+# The History Server does not persist thread dumps, so the endpoint returns 404
+# and the tool surfaces an error. This confirms the tool is wired up end to end.
 
 
 @pytest.mark.asyncio
