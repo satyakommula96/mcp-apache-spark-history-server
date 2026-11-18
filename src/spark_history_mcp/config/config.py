@@ -153,6 +153,14 @@ class ServerConfig(BaseModel):
     use_proxy: bool = False
     timeout: int = 30  # HTTP request timeout in seconds
     include_plan_description: Optional[bool] = None
+    # Read Spark event logs directly from this directory (gs://, s3a://,
+    # s3://, file:/ or a local path) instead of a History Server's REST API.
+    # App listing, environment and raw-log tools need no History Server;
+    # stage/task/executor/SQL calls start a local one over the directory on
+    # first use, unless auto_history_server is false.
+    event_log_dir: Optional[str] = None
+    auto_history_server: bool = True
+    history_server_memory: Optional[str] = None  # daemon heap, default "4g"
     # Ignore unknown keys for compatibility with the shared shs CLI config.
     model_config = ConfigDict(extra="ignore")
 

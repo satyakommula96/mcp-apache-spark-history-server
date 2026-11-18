@@ -16,6 +16,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
 from spark_history_mcp.api.emr_persistent_ui_client import EMRPersistentUIClient
+from spark_history_mcp.api.event_log_client import EventLogClient
 from spark_history_mcp.api.spark_client import SparkRestClient
 from spark_history_mcp.config.config import Config, load_config
 
@@ -33,7 +34,7 @@ def _emr_cookie_reauth(emr_client: EMRPersistentUIClient) -> str:
 
 @dataclass
 class AppContext:
-    clients: dict[str, SparkRestClient]
+    clients: dict[str, SparkRestClient | EventLogClient]
     default_client: Optional[SparkRestClient] = None
     app_discovery: Optional[ApplicationDiscovery] = None
 
@@ -46,8 +47,12 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[AppContext]:
     default_client = None
 
     for name, server_config in config.servers.items():
+        if server_config.event_log_dir:
+            # Read event logs directly; a History Server is started lazily
+            # only for calls that need one.
+            clients[name] = EventLogClient(server_config, name=name)
         # Check if this is an EMR server configuration
-        if server_config.emr_cluster_arn:
+        elif server_config.emr_cluster_arn:
             # Create EMR client
             emr_client = EMRPersistentUIClient(server_config)
 

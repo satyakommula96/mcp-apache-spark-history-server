@@ -9,6 +9,17 @@ servers:
     #   password: ${SHS_SERVERS__LOCAL__AUTH__PASSWORD}
     #   token: ${SHS_SPARK_TOKEN}
 
+  # Read event logs directly, without running a History Server. App listing,
+  # environment/config comparison and the Gluten/DPAS raw-log tools read the
+  # files; stage/task/executor/SQL calls start a local History Server over
+  # the same directory on first use (needs SPARK_HOME; set
+  # auto_history_server: false to never start one). For per-run directories,
+  # use the open_event_logs tool instead of listing them here.
+  # benchmark_logs:
+  #   event_log_dir: "gs://my-bucket/path/to/spark-logs"   # or s3a://, file:/
+  #   auto_history_server: true
+  #   history_server_memory: "4g"
+
   # Production server example
   # production:
   #   url: "https://spark-history.company.com:18080"

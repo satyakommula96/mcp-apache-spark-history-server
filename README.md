@@ -164,6 +164,29 @@ mcp:
   debug: false
 ```
 
+#### Reading event logs directly (no History Server)
+
+Point a server at an event-log directory instead of a History Server URL:
+
+```yaml
+servers:
+  benchmark_logs:
+    event_log_dir: "gs://my-bucket/path/to/spark-logs"   # gs://, s3a://, s3://, file:/ or a local path
+```
+
+or register one at runtime with the `open_event_logs` tool (handy when every
+run writes to its own directory). Application listing, environment and
+configuration comparison, and the raw-event-log Gluten/DPAS tools then read
+the log files directly: no JVM and no replay wait. Plain, lz4, zstd and snappy
+logs and rolling (`eventlog_v2_*`) logs are supported. Stage, task, executor,
+job and SQL tools need the aggregates Spark computes while replaying a log, so
+the first such call starts a local History Server over the same directory
+(`SPARK_HOME` must point at a Spark distribution; set
+`auto_history_server: false` to disable this) and reuses it afterwards.
+Summaries of completed logs are cached in `~/.cache/spark-mcp/eventlog`
+(`SPARK_MCP_EVENTLOG_CACHE`). GCS uses Application Default Credentials; S3
+needs the `s3` extra (`uv sync --extra s3`).
+
 #### Config file location
 
 The server looks for its config file in the following order and uses the first one it finds:
