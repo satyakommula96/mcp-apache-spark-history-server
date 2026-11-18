@@ -344,7 +344,7 @@ graph TB
 - *"Compare today's batch with yesterday's run"* → `compare_job_performance` + `compare_job_environments`
 - *"Find my slowest SQL queries and explain why"* → `list_sql_executions` + `get_sql_execution` + `compare_sql_executions`
 
-### Prompts (2)
+### Prompts (3)
 
 Beyond tools, the server exposes **MCP prompts** — reusable, multi-step investigation workflows that your agent runs as a single command. Each prompt expands into a guided sequence of tool calls (which the agent still executes one at a time), so you get a consistent, evidence-driven analysis without having to remember the right tool order.
 
@@ -352,6 +352,7 @@ Beyond tools, the server exposes **MCP prompts** — reusable, multi-step invest
 |--------|-----------|-------------|
 | `investigate_failure` | `app_id` (required), `server` (optional) | Guided root-cause investigation for a failed Spark application — walks from the failed app down to the individual task exceptions. |
 | `compare_applications` | `app_a` (required), `app_b` (required), `server` (optional), `context` (optional) | Layered, descriptive comparison of two applications (configuration → app metrics → SQL/jobs → stages). |
+| `investigate_slowness` | `dpas_app_id` (required), `baseline_app_id` (required), `server` (optional), `context` (optional) | Root-cause investigation of a DPAS/Gluten-accelerated run that isn't faster than its non-accelerated baseline — verifies acceleration actually engaged, then checks for operator fallback or a resource constraint. |
 
 > `server` is optional: when omitted, the prompt searches every configured server for the application(s). Pass `server="<name>"` only to target a specific server or disambiguate an id that exists on more than one.
 
@@ -368,6 +369,9 @@ MCP prompts surface as slash commands with the format `/mcp__<server>__<prompt>`
 
 # Compare two applications
 /mcp__spark-history__compare_applications spark-app-A spark-app-B
+
+# Investigate why a DPAS/Gluten-accelerated run isn't faster than its baseline
+/mcp__spark-history__investigate_slowness spark-dpas-run spark-baseline-run
 ```
 
 #### Using prompts in Kiro CLI
@@ -423,9 +427,19 @@ kubectl port-forward svc/spark-history-mcp 18888:18888
 
 ## 📔 AWS Integration
 
-- **[AWS Glue](examples/aws/glue/README.md)** — Connect to Glue Spark History Server
+- **[AWS Glue](examples/aws/glue/README.md)** — Write Glue event logs to S3, then run a local or EC2 History Server against them (covers jobs and interactive sessions)
 - **[Amazon EMR](examples/aws/emr/README.md)** — Use EMR Persistent UI for Spark analysis
+- **[Spark on EKS](examples/aws/eks/README.md)** — Spark Operator or EMR on EKS jobs with S3 event logs: in-cluster History Server, or a local one started against `s3://` with [`start_cloud_spark_history.sh`](examples/cloud/README.md)
 - **AWS Spark Troubleshooting** — One-shot root cause analysis and code fix recommendations for failed Spark workloads (EMR EC2, EMR Serverless). Automatically available when AWS credentials and region are configured. See [IAM setup guide](https://docs.aws.amazon.com/emr/latest/ReleaseGuide/spark-troubleshooting-agent-iam-setup.html) for required permissions.
+
+---
+
+## ☁️ GCP Integration
+
+- **[Dataproc](examples/gcp/dataproc/README.md)** — Tunnel to a cluster's History Server, use a Persistent History Server, or read a cluster's `spark-job-history` directory in GCS
+- **[Dataproc Serverless](examples/gcp/dataproc-serverless/README.md)** — Route batch event logs to a Persistent History Server or your own bucket
+- **[Spark on GKE](examples/gcp/gke/README.md)** — Spark Operator jobs with GCS event logs: in-cluster History Server, or a local one
+- **[Cloud event logs (GCS / S3)](examples/cloud/README.md)** — `start_cloud_spark_history.sh` starts a local Spark History Server directly against `gs://` or `s3://` event logs, with no download step
 
 ---
 

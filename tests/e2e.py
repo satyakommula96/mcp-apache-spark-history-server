@@ -326,6 +326,52 @@ async def test_compare_applications_prompt_with_server_and_context():
 
 @pytest.mark.stdio_smoke
 @pytest.mark.asyncio
+async def test_investigate_slowness_prompt_without_server():
+    """The prompt renders both app ids, names the diagnostic tools and the
+    Gluten/DPAS acceleration markers, and explains cross-server discovery
+    without injecting a concrete server name."""
+    async with McpClient() as client:
+        result = await client.get_prompt(
+            "investigate_slowness",
+            {"dpas_app_id": app1_id, "baseline_app_id": app2_id},
+        )
+        text = _prompt_text(result)
+
+        assert app1_id in text
+        assert app2_id in text
+        for tool_name in (
+            "get_environment",
+            "compare_job_performance",
+            "compare_sql_executions",
+            "get_stage",
+        ):
+            assert tool_name in text
+        assert "org.apache.gluten.GlutenPlugin" in text
+        assert "may live on different" in text
+        assert 'server="local"' not in text
+        assert 'server="secondary"' not in text
+
+
+@pytest.mark.asyncio
+async def test_investigate_slowness_prompt_with_server_and_context():
+    """A specified server is threaded into the calls and context is embedded."""
+    async with McpClient() as client:
+        result = await client.get_prompt(
+            "investigate_slowness",
+            {
+                "dpas_app_id": app1_id,
+                "baseline_app_id": app2_id,
+                "server": "secondary",
+                "context": "same TPC-DS query, DPAS run is 40% slower",
+            },
+        )
+        text = _prompt_text(result)
+
+        assert 'server="secondary"' in text
+        assert "same TPC-DS query, DPAS run is 40% slower" in text
+
+
+@pytest.mark.asyncio
 async def test_list_applications():
     async with McpClient() as client:
         result = await client.call_tool("list_applications", {})
