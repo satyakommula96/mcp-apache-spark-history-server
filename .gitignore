@@ -278,3 +278,8 @@ kubeconfig.yaml
 
 # OpenAPI Generator metadata
 src/.openapi-generator/
+
+# Downloaded connector jars / generated run config (incl. copied credentials)
+# for examples/cloud/start_cloud_spark_history.sh
+examples/cloud/.cache/
+examples/cloud/run-*/
